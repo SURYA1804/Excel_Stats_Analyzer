@@ -1,0 +1,11 @@
+pandas
+numpy
+openpyxl
+streamlit
+python-dotenv
+
+langchain-core
+langgraph
+langchain
+langchain-community
+langchain-groq
