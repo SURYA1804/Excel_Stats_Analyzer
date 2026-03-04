@@ -280,7 +280,7 @@ STRICT RULES:
 - Always: SELECT ... FROM data ...
 - Top-N   → ORDER BY <col> DESC LIMIT N  (include all relevant columns)
 - Aggregate → SELECT cat_col, AGG(val_col) FROM data GROUP BY cat_col
-- Include the primary key column wherever possible.
+- Include the primary key,Naming Columns like Name,department columns wherever possible.
 
 Question: {question}
 SQL:"""
@@ -570,3 +570,7 @@ def analyze_query_structured(df: pd.DataFrame, query: str, df_summary: str) -> d
     except Exception as exc:
         logger.exception("analyze_query_structured outer exception")
         return {"summary": "", "columns": [], "rows": [], "followups": [], "error": str(exc)}
+    
+
+
+
