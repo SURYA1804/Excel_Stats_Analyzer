@@ -110,13 +110,13 @@ html, body, [data-testid="stAppViewContainer"] {
 .followup-label {
     font-family: 'IBM Plex Mono', monospace; font-size: 0.58rem;
     letter-spacing: 0.14em; text-transform: uppercase;
-    color: #334155; margin-bottom: 6px;
+    color: #cbd4e2; margin-bottom: 6px;
 }
 
 /* ── Export label ── */
 .export-label {
     font-family: 'IBM Plex Mono', monospace; font-size: 0.58rem;
-    letter-spacing: 0.14em; text-transform: uppercase; color: #334155;
+    letter-spacing: 0.14em; text-transform: uppercase; color: #cbd4e2;
 }
 
 /* Download button — ghost */
@@ -289,7 +289,7 @@ def render_answer(chat: dict, idx: int, is_latest: bool):
             st.download_button(
                 label="⬇ Download Excel",
                 data=excel_bytes,
-                file_name="ExcelLens_result.xlsx",
+                file_name="Excellens_result.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_{idx}",
             )
@@ -467,7 +467,7 @@ st.markdown("""
 <div style="background:#080c14;border:1px solid #1e2d3d;border-radius:12px;padding:20px;margin-bottom:20px;">
     <div style="font-family:'IBM Plex Mono',monospace;font-size:0.62rem;letter-spacing:0.15em;
                 text-transform:uppercase;color:#7c3aed;margin-bottom:4px;">Level 2 Pre-joins</div>
-    <div style="font-family:'IBM Plex Sans',sans-serif;font-size:0.78rem;color: rgb(186, 198, 215);;margin-bottom:16px;">
+    <div style="font-family:'IBM Plex Sans',sans-serif;font-size:0.78rem;color:#475569;margin-bottom:16px;">
         Join datasets that are not directly connected to your main table.
         Their merged result becomes available for the Level 1 join below.
     </div>
@@ -547,7 +547,7 @@ st.markdown("""
 <div style="background:#080c14;border:1px solid #1e2d3d;border-radius:12px;padding:20px;">
     <div style="font-family:'IBM Plex Mono',monospace;font-size:0.62rem;letter-spacing:0.15em;
                 text-transform:uppercase;color:#2563eb;margin-bottom:4px;">Level 1 — Main Join</div>
-    <div style="font-family:'IBM Plex Sans',sans-serif;font-size:0.78rem;color: rgb(186, 198, 215);margin-bottom:16px;">
+    <div style="font-family:'IBM Plex Sans',sans-serif;font-size:0.78rem;color:#475569;margin-bottom:16px;">
         Select your primary table and join it with any dataset (including L2 pre-joined results above).
     </div>
 """, unsafe_allow_html=True)
@@ -572,7 +572,7 @@ if join_targets:
     detected_cols = find_auto_join_columns(all_join_dfs)
     if detected_cols:
         badges = "".join([f'<span class="join-badge">⟷ {col}</span>' for col in list(detected_cols.keys())[:8]])
-        st.markdown(f'<div style="margin:10px 0 4px 0;font-size:0.7rem;color: rgb(186, 198, 215);font-family:IBM Plex Mono,monospace;">Auto-detected join keys:</div>{badges}', unsafe_allow_html=True)
+        st.markdown(f'<div style="margin:10px 0 4px 0;font-size:0.7rem;color:#475569;font-family:IBM Plex Mono,monospace;">Auto-detected join keys:</div>{badges}', unsafe_allow_html=True)
     else:
         st.warning("No common columns found between selected datasets.")
 
@@ -664,10 +664,35 @@ if st.session_state.merged_df is not None:
 
         with st.chat_message("assistant", avatar="🔬"):
             with st.spinner("Running analysis…"):
+                # Build compact history from previous assistant turns
+                # Each entry gives the reformulation node enough context to
+                # resolve "he / she / his / that department / the same one" etc.
+                history_for_graph = []
+                for h in st.session_state.chat_history:
+                    if h["role"] == "assistant":
+                        history_for_graph.append({
+                            "question": h.get("question", ""),
+                            "summary":  h.get("structured", {}).get("summary", ""),
+                            "columns":  h.get("structured", {}).get("columns", []),
+                            # pass first 3 rows only — enough for entity resolution
+                            "rows":     h.get("structured", {}).get("rows", [])[:3],
+                        })
+
                 structured = analyze_query_structured(
                     st.session_state.merged_df,
                     prompt,
                     st.session_state.df_summary,
+                    chat_history=history_for_graph,
+                )
+
+            # Show reformulated question if it differs from original (dev hint)
+            reformulated = structured.get("reformulated_question", "")
+            if reformulated and reformulated.lower() != prompt.lower():
+                st.markdown(
+                    f'<div style="font-family:IBM Plex Mono,monospace;font-size:0.62rem;'
+                    f'color:#334155;margin-bottom:8px;">🔄 Interpreted as: '
+                    f'<span style="color:#475569;">{reformulated}</span></div>',
+                    unsafe_allow_html=True,
                 )
             assistant_entry = {
                 "role": "assistant",

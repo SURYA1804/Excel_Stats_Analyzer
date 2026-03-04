@@ -94,6 +94,16 @@ class StructuredState(TypedDict):
     raw_conn:   Any         # shared sqlite3.Connection
     llm:        Any         # ChatGroq instance
 
+    # ── Conversational memory ──────────────────────────────────────────────
+    # List of {"question": str, "summary": str} dicts from previous turns.
+    # Used by node_reformulate_query to resolve pronouns / references.
+    chat_history: List[Dict]
+
+    # ── Node 0: reformulate_query ──────────────────────────────────────────
+    # The rewritten, self-contained version of `question`.
+    # If no history / no ambiguity, equals `question` unchanged.
+    reformulated_question: Optional[str]
+
     # ── Node 1: generate_sql ───────────────────────────────────────────────
     generated_sql: Optional[str]
     sql_error:     Optional[str]
@@ -265,6 +275,30 @@ def analyze_query(df: pd.DataFrame, query: str, df_summary: str) -> str:
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
+# ── Node 0 prompt — query reformulation ───────────────────────────────────────
+_REFORMULATE_PROMPT = """\
+You are a query reformulation assistant. Rewrite the user's latest question into \
+a fully self-contained question using the conversation history below.
+
+CONVERSATION HISTORY (most recent last):
+{history_text}
+
+LATEST QUESTION: {question}
+
+RULES:
+- If the question is already self-contained (no pronouns, no back-references),
+  output it UNCHANGED.
+- If it contains pronouns (he, she, they, his, her, their, it) or references
+  (that employee, the same department, the one above, those people) — resolve
+  them using the history.
+- CRITICAL — always reference entities by their PRIMARY KEY values, not by name:
+    WRONG  : "What is the department of David Wilson and Mike Brown?"
+    CORRECT: "What is the department of employees with emp_id IN (3, 7)?"
+- Use the primary key column name and values from the history snippet.
+- Output ONLY the rewritten question. No explanation, no prefix, no quotes.
+
+REWRITTEN QUESTION:"""
+
 _SQL_GEN_PROMPT = """\
 You are a SQL expert. Write ONE valid SQLite SELECT query for the question below.
 
@@ -275,12 +309,21 @@ DATA SUMMARY:
 {df_summary}
 
 STRICT RULES:
+- With data Summary identify the primary key
 - Output ONLY the raw SQL. No explanation, no markdown, no backticks.
 - Use only column names listed above.
 - Always: SELECT ... FROM data ...
 - Top-N   → ORDER BY <col> DESC LIMIT N  (include all relevant columns)
 - Aggregate → SELECT cat_col, AGG(val_col) FROM data GROUP BY cat_col
-- Include the primary key,Naming Columns like Name,department columns wherever possible.
+- Include the primary key,name,mentioned fields columns in SELECT wherever possible.
+- For Aggregrate Question(Count,Max,Min,Avg) Give Meaningfull Alias name,it should be understand by everyone.
+WHERE CLAUSE RULES (critical):
+- ALWAYS filter using the primary key column (e.g. emp_id, employee_id, id, student_id).
+- NEVER use name columns (name, employee_name, full_name, etc.) in WHERE.
+- If the question references specific people or entities by name, look up their
+  primary key values from the question context and use those in WHERE instead.
+- Example WRONG : WHERE name IN ('David Wilson', 'Mike Brown')
+- Example CORRECT: WHERE emp_id IN (3, 7)
 
 Question: {question}
 SQL:"""
@@ -289,7 +332,7 @@ _META_PROMPT = """\
 You are a data analyst. Output ONLY the JSON below — no markdown, no extra text.
 
 {{
-  "summary": "One clear sentence describing what the result shows.",
+  "summary": "Use the question,columns,total rows, first 3 rows with that give One clear sentence describing what the result shows.",
   "followups": [
     "Relevant follow-up question 1",
     "Relevant follow-up question 2",
@@ -303,21 +346,124 @@ Total rows     : {row_count}
 First 3 rows   : {sample}"""
 
 
+# ── Node 0 — reformulate_query ────────────────────────────────────────────────
+def node_reformulate_query(state: StructuredState) -> StructuredState:
+    """
+    Rewrites the user's question into a fully self-contained query by resolving
+    pronouns and implicit references using the conversation history.
+
+    Examples:
+        history:  Q: "top 1 employee by salary" → summary: "David Wilson, ₹95,000"
+        question: "what is his mobile number"
+        output:   "What is the mobile number of David Wilson?"
+
+        history:  Q: "employees in Engineering" → summary: "12 employees found"
+        question: "how many are above 35"
+        output:   "How many employees in Engineering are above 35 years old?"
+
+    If chat_history is empty or the question is already self-contained,
+    reformulated_question == question (no-op).
+    """
+    question = state["question"]
+    history  = state.get("chat_history", [])
+
+    # Skip if no history to draw from
+    if not history:
+        logger.debug("Node0 | no history — skipping reformulation")
+        return {**state, "reformulated_question": question}
+
+    # Build compact history text: last 6 turns max to keep prompt small
+    recent   = history[-6:]
+    history_lines = []
+    for i, turn in enumerate(recent, 1):
+        q    = turn.get("question", "")
+        s    = turn.get("summary", "")
+        rows = turn.get("rows", [])
+        cols = turn.get("columns", [])
+
+        snippet = ""
+        if rows and cols:
+            try:
+                # Detect the primary key column — prefer columns whose name
+                # ends with _id or equals 'id', falling back to first column.
+                pk_col = None
+                pk_idx = None
+                for idx, col in enumerate(cols):
+                    col_lower = col.lower()
+                    if col_lower == "id" or col_lower.endswith("_id"):
+                        pk_col = col
+                        pk_idx = idx
+                        break
+                if pk_col is None:
+                    pk_col = cols[0]
+                    pk_idx = 0
+
+                # Collect primary key values across ALL result rows (not just first)
+                pk_values = [str(row[pk_idx]) for row in rows if len(row) > pk_idx]
+
+                # Also collect display name for readability (second non-pk column)
+                name_col  = next(
+                    (c for c in cols if c.lower() not in (pk_col.lower(),)
+                     and any(kw in c.lower() for kw in ["name", "title", "label"])),
+                    None
+                )
+                name_idx  = cols.index(name_col) if name_col else None
+
+                if pk_values:
+                    pk_list = ", ".join(pk_values[:10])  # cap at 10 to keep prompt small
+                    snippet = f" | {pk_col} values: [{pk_list}]"
+                    if name_idx is not None:
+                        names = [str(row[name_idx]) for row in rows[:5] if len(row) > name_idx]
+                        snippet += f" | names: {', '.join(names)}"
+            except Exception:
+                pass
+
+        history_lines.append(f"Turn {i}: Q: {q} → {s}{snippet}")
+
+    history_text = "\n".join(history_lines)
+
+    logger.info("Node0 | reformulating | history turns: %d | question: %s",
+                len(recent), question)
+
+    try:
+        prompt   = _REFORMULATE_PROMPT.format(
+            history_text=history_text,
+            question=question,
+        )
+        response = state["llm"].invoke([HumanMessage(content=prompt)])
+        rewritten = response.content.strip().strip('"').strip("'")
+
+        # Safety: if LLM returns something suspiciously long or empty, fall back
+        if not rewritten or len(rewritten) > 500:
+            rewritten = question
+
+        logger.info("Node0 | reformulated: %s → %s", question, rewritten)
+        return {**state, "reformulated_question": rewritten}
+
+    except Exception as exc:
+        logger.warning("Node0 | reformulation failed (%s) — using original", exc)
+        return {**state, "reformulated_question": question}
+
+
 # ── Node 1 — generate_sql ──────────────────────────────────────────────────────
 def node_generate_sql(state: StructuredState) -> StructuredState:
     """
     Ask the LLM (plain invoke — NO tools bound) to produce a SQL SELECT query.
+    Uses reformulated_question (pronoun-resolved) so references like "his" or
+    "that department" are already replaced with concrete values.
 
     Why no tools here?
         We only need a SQL string, not data yet.
         Using bind_tools would risk Groq treating the SQL string as a tool call.
     """
-    logger.info("Node1 | generate_sql | q: %s", state["question"])
+    # Always use the reformulated (self-contained) question for SQL generation
+    question = state.get("reformulated_question") or state["question"]
+    logger.info("Node1 | generate_sql | q: %s", question)
     try:
         prompt = _SQL_GEN_PROMPT.format(
             col_names=state["col_names"],
             df_summary=state["df_summary"],
-            question=state["question"],
+            question=question,
         )
         resp = state["llm"].invoke([HumanMessage(content=prompt)])
         sql  = _extract_sql(resp.content)
@@ -484,21 +630,23 @@ def _build_structured_graph():
     Compile Agent 2.
 
     Node wiring:
-        generate_sql ──ok──▶ execute_sql ──ok──▶ generate_meta ──▶ assemble ──▶ END
-                     ╲error             ╲error                  ╱
-                      ╲                  ╲──────▶ fallback ─────
-                       ╲                 ╲empty▶ assemble
-                        ╲──────────────────────▶ fallback
+        reformulate_query → generate_sql ──ok──▶ execute_sql ──ok──▶ generate_meta ──▶ assemble ──▶ END
+                                          ╲error             ╲error                  ╱
+                                           ╲                  ╲──────▶ fallback ─────
+                                            ╲                 ╲empty▶ assemble
+                                             ╲──────────────────────▶ fallback
     """
     wf = StateGraph(StructuredState)
 
-    wf.add_node("generate_sql",  node_generate_sql)
-    wf.add_node("execute_sql",   node_execute_sql)
-    wf.add_node("generate_meta", node_generate_meta)
-    wf.add_node("fallback",      node_fallback)
-    wf.add_node("assemble",      node_assemble)
+    wf.add_node("reformulate_query", node_reformulate_query)   # Node 0 — memory
+    wf.add_node("generate_sql",      node_generate_sql)        # Node 1
+    wf.add_node("execute_sql",       node_execute_sql)         # Node 2
+    wf.add_node("generate_meta",     node_generate_meta)       # Node 3
+    wf.add_node("fallback",          node_fallback)            # Node 4
+    wf.add_node("assemble",          node_assemble)            # Node 5
 
-    wf.set_entry_point("generate_sql")
+    wf.set_entry_point("reformulate_query")
+    wf.add_edge("reformulate_query", "generate_sql")
 
     wf.add_conditional_edges(
         "generate_sql",
@@ -520,41 +668,48 @@ def _build_structured_graph():
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def analyze_query_structured(df: pd.DataFrame, query: str, df_summary: str) -> dict:
+def analyze_query_structured(
+    df: pd.DataFrame,
+    query: str,
+    df_summary: str,
+    chat_history: List[Dict] = None,
+) -> dict:
     """
     Public API — run Agent 2 (structured LangGraph).
 
+    chat_history: list of previous turns, each a dict:
+        {"question": str, "summary": str, "columns": [...], "rows": [[...]]}
+
+    Node 0 (reformulate_query) uses this to resolve pronouns before SQL generation:
+        "what is his mobile number"  ->  "what is David Wilson's mobile number"
+        "how many are in that dept"  ->  "how many employees are in Engineering"
+
     Returns:
-        {
-          "summary":   str,           one-sentence description
-          "columns":   [str, ...],    actual column names from SQL result
-          "rows":      [[val, ...]],  full data from pandas — no truncation
-          "followups": [str, str, str],
-          "error":     str | None
-        }
+        {"summary": str, "columns": [...], "rows": [...], "followups": [...], "error": str|None}
     """
-    logger.info("analyze_query_structured | query: %s", query)
+    logger.info("analyze_query_structured | query: %s | history turns: %d",
+                query, len(chat_history or []))
     try:
         llm          = _build_llm()
         _, raw_conn  = _build_db(df)
 
         initial: StructuredState = {
-            # inputs
-            "question":        query,
-            "df_summary":      df_summary,
-            "col_names":       ", ".join(df.columns.tolist()),
-            "raw_conn":        raw_conn,
-            "llm":             llm,
-            # node outputs — all None at graph entry
-            "generated_sql":   None,
-            "sql_error":       None,
-            "result_df":       None,
-            "execution_error": None,
-            "summary":         None,
-            "followups":       None,
-            "meta_error":      None,
-            "fallback_text":   None,
-            "final_result":    None,
+            "question":              query,
+            "df_summary":            df_summary,
+            "col_names":             ", ".join(df.columns.tolist()),
+            "raw_conn":              raw_conn,
+            "llm":                   llm,
+            "chat_history":          chat_history or [],
+            "reformulated_question": None,
+            "generated_sql":         None,
+            "sql_error":             None,
+            "result_df":             None,
+            "execution_error":       None,
+            "summary":               None,
+            "followups":             None,
+            "meta_error":            None,
+            "fallback_text":         None,
+            "final_result":          None,
         }
 
         graph  = _build_structured_graph()
@@ -562,15 +717,11 @@ def analyze_query_structured(df: pd.DataFrame, query: str, df_summary: str) -> d
 
         final = result.get("final_result")
         if final:
+            final["reformulated_question"] = result.get("reformulated_question") or query
             return final
 
-        # Should never reach here — both assemble and fallback always set final_result
         return {"summary": "No result produced.", "columns": [], "rows": [], "followups": [], "error": None}
 
     except Exception as exc:
         logger.exception("analyze_query_structured outer exception")
         return {"summary": "", "columns": [], "rows": [], "followups": [], "error": str(exc)}
-    
-
-
-
