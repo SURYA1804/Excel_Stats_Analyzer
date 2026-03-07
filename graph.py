@@ -61,6 +61,7 @@ from langchain_community.utilities import SQLDatabase
 from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.tools import tool
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -103,6 +104,11 @@ class StructuredState(TypedDict):
     # The rewritten, self-contained version of `question`.
     # If no history / no ambiguity, equals `question` unchanged.
     reformulated_question: Optional[str]
+
+    # ── Node -1: greetings / common question gate ──────────────────────────
+    # True  → greeting or ExcelLens info request → short-circuits to END
+    # False → data question → continues to reformulate_query → SQL pipeline
+    common_question: Optional[bool]
 
     # ── Node 1: generate_sql ───────────────────────────────────────────────
     generated_sql: Optional[str]
@@ -328,11 +334,12 @@ WHERE CLAUSE RULES (critical):
 Question: {question}
 SQL:"""
 
+
 _META_PROMPT = """\
 You are a data analyst. Output ONLY the JSON below — no markdown, no extra text.
 
 {{
-  "summary": "Use the question,columns,total rows, first 3 rows with that give One clear sentence describing what the result shows.",
+  "summary": "One clear sentence describing what the result shows.",
   "followups": [
     "Relevant follow-up question 1",
     "Relevant follow-up question 2",
@@ -603,6 +610,197 @@ def node_assemble(state: StructuredState) -> StructuredState:
     return {**state, "final_result": final}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE -1 — GREETINGS / COMMON QUESTION GATE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# This is the TRUE entry point of the graph.
+# It classifies every incoming question into one of two buckets:
+#
+#   common_question = True  → greeting ("hi", "hello") or question about
+#                             ExcelLens itself ("what can you do?", "how does
+#                             this work?") → answer immediately, skip SQL pipeline
+#
+#   common_question = False → data question ("top 5 employees", "avg salary")
+#                           → pass to reformulate_query → generate_sql → …
+#
+# The LLM uses the AboutExcelLensTool to answer product questions so the answer
+# is always grounded in the real feature set, not hallucinated.
+
+
+# ── About ExcelLens knowledge base ────────────────────────────────────────────
+@tool
+def AboutExcelLensTool() -> str:
+    """
+    Returns detailed information about ExcelLens — what it is, what it can do,
+    and how to use it. Call this tool whenever the user asks about ExcelLens,
+    its features, how it works, or what they can do with it.
+    """
+    return """
+ExcelLens — Excel Intelligence Platform
+========================================
+ExcelLens is an AI-powered Excel analytics platform that turns raw spreadsheets
+into a conversational data warehouse. No SQL knowledge required.
+
+CORE FEATURES:
+1. Multi-file Upload
+   - Upload any number of .xlsx / .xls files at once.
+   - Columns and data types are detected automatically.
+
+2. Multi-level Join Builder
+   - Level 2 pre-joins: join datasets that are not directly connected to your
+     main table (e.g. regions ⟷ country_codes → merged result).
+   - Level 1 main join: connect the primary table with any dataset, including
+     L2 pre-joined results.
+
+3. Conversational AI Query Interface
+   - Ask plain-English statistical questions: "Top 5 employees by salary",
+     "Average score by department", "Count employees above age 35".
+   - Ask natural follow-ups: "What is their department?", "Show his mobile number"
+     — ExcelLens remembers previous results and resolves pronouns automatically.
+   - Primary key tracking: WHERE clauses always use emp_id / student_id etc.,
+     never fragile name-based filters.
+
+4. Scale-safe Pipeline
+   - Works with 100 rows or 10 million rows identically.
+   - The LLM only generates SQL — pandas executes it directly, so row data
+     never passes through the LLM context window.
+
+5. Structured Results
+   - Every answer renders as a dynamic, sortable table with real column names.
+   - A one-sentence summary and 3 suggested follow-up questions are generated
+     per answer.
+
+6. One-click Excel Export
+   - Download results as a styled .xlsx with:
+       Sheet 1 "Results" — full data table with actual column headers
+       Sheet 2 "Info"    — original question + summary
+
+7. Dark Professional UI
+   - Built with IBM Plex + Syne typography on a dark theme.
+   - Powered by LangGraph, Groq LLM (LLaMA 3 70B), Pandas, and Streamlit.
+
+HOW TO USE:
+  Step 1 — Upload your .xlsx files in the sidebar.
+  Step 2 — Configure joins (L2 pre-joins if needed, then L1 main join).
+  Step 3 — Ask any question about your data in the chat box.
+  Step 4 — Click follow-up chips or download results as Excel.
+
+GITHUB   : https://github.com/SURYA1804/Excel_Stats_Analyzer
+"""
+
+# ── Prompt for the greetings / classifier node ────────────────────────────────
+_GREETINGS_PROMPT = """You are the assistant for ExcelLens — an AI-powered Excel Intelligence Platform.
+
+Your job:
+1. If the user's message is a greeting (hi, hello, hey, good morning, etc.)
+   → reply warmly and invite them to ask about their data or ExcelLens.
+
+2. If the user is asking about ExcelLens itself (what it does, its features,
+   how to use it, what questions it can answer, etc.)
+   → call the AboutExcelLensTool to get accurate information, then answer.
+
+3. If the question is clearly a DATA question (about employees, salary, sales,
+   departments, rows, columns, statistics, etc.) → set common_question to false.
+
+OUTPUT — respond ONLY with this exact JSON, no markdown, no extra text:
+{{
+  "answer": "your reply here (empty string if common_question is false)",
+  "common_question": true or false
+}}
+
+User message: {question}
+"""
+
+
+# ── Node -1 ────────────────────────────────────────────────────────────────────
+def node_greetings(state: StructuredState) -> StructuredState:
+    """
+    Entry node — classifies the question as common (greeting / product info)
+    or a data query.
+
+    If common_question = True:
+        • Answers immediately using the LLM + AboutExcelLensTool if needed.
+        • Sets final_result so the graph ends at END without touching SQL nodes.
+
+    If common_question = False:
+        • Sets common_question = False and passes through unchanged.
+        • The router sends the state to reformulate_query → SQL pipeline.
+
+    Why use bind_tools here but not in generate_sql / generate_meta?
+        Here the LLM needs to optionally call AboutExcelLensTool to fetch
+        product info. In SQL nodes, any tool binding causes Groq to try to
+        parse the SQL string as a tool call → 400 error. Greetings node
+        returns JSON that is NOT a SQL string, so the tool binding is safe.
+    """
+    question = state["question"]
+    logger.info("Node-1 | greetings | q: %s", question)
+
+    try:
+        llm_with_tool = state["llm"].bind_tools([AboutExcelLensTool])
+        prompt        = _GREETINGS_PROMPT.format(question=question)
+        response      = llm_with_tool.invoke([HumanMessage(content=prompt)])
+
+        # ── Handle tool call if LLM called AboutExcelLensTool ─────────────
+        answer_text = ""
+        is_common   = False
+
+        if response.tool_calls:
+            # LLM called the tool — execute it and feed result back
+            tool_result = AboutExcelLensTool.invoke({})
+            follow_up   = state["llm"].invoke([
+                HumanMessage(content=prompt),
+                response,
+                HumanMessage(content="Tool result:\n" + tool_result + "\n\nNow produce the JSON output."),
+            ])
+            raw = follow_up.content.strip()
+        else:
+            raw = response.content.strip()
+
+        # ── Parse JSON response ────────────────────────────────────────────
+        try:
+            parsed      = _parse_json_block(raw)
+            answer_text = parsed.get("answer", "")
+            is_common   = bool(parsed.get("common_question", False))
+        except Exception:
+            # If JSON parse fails, treat as data question to be safe
+            logger.warning("Node-1 | JSON parse failed — treating as data question")
+            is_common   = False
+
+        logger.info("Node-1 | common_question=%s | answer: %.120s", is_common, answer_text)
+
+        if is_common:
+            # Short-circuit: build final_result immediately, skip SQL pipeline
+            final = {
+                "summary":   answer_text,
+                "columns":   [],
+                "rows":      [],
+                "followups": [
+                    "What file formats does ExcelLens support?",
+                    "How do I join multiple Excel files?",
+                    "Can I export query results to Excel?",
+                ],
+                "error":     None,
+            }
+            return {**state, "common_question": True, "final_result": final}
+
+        # Data question — pass through, SQL pipeline will handle it
+        return {**state, "common_question": False}
+
+    except Exception as exc:
+        logger.warning("Node-1 | greetings node failed (%s) — treating as data question", exc)
+        return {**state, "common_question": False}
+
+
+# ── Router: after greetings ────────────────────────────────────────────────────
+def _route_after_greetings(state: StructuredState) -> str:
+    if state.get("common_question") is True:
+        logger.info("Router | greetings → END (common question answered)")
+        return "end"
+    logger.info("Router | greetings → reformulate_query (data question)")
+    return "reformulate_query"
+
+
 # ── Routing functions ──────────────────────────────────────────────────────────
 
 def _route_after_generate_sql(state: StructuredState) -> str:
@@ -630,7 +828,10 @@ def _build_structured_graph():
     Compile Agent 2.
 
     Node wiring:
-        reformulate_query → generate_sql ──ok──▶ execute_sql ──ok──▶ generate_meta ──▶ assemble ──▶ END
+        greetings ──common──▶ END  (greeting / ExcelLens info answered immediately)
+                  ──data───▶ reformulate_query
+                                    │
+                             generate_sql ──ok──▶ execute_sql ──ok──▶ generate_meta ──▶ assemble ──▶ END
                                           ╲error             ╲error                  ╱
                                            ╲                  ╲──────▶ fallback ─────
                                             ╲                 ╲empty▶ assemble
@@ -638,6 +839,7 @@ def _build_structured_graph():
     """
     wf = StateGraph(StructuredState)
 
+    wf.add_node("greetings",         node_greetings)            # Node -1 — gate
     wf.add_node("reformulate_query", node_reformulate_query)   # Node 0 — memory
     wf.add_node("generate_sql",      node_generate_sql)        # Node 1
     wf.add_node("execute_sql",       node_execute_sql)         # Node 2
@@ -645,7 +847,12 @@ def _build_structured_graph():
     wf.add_node("fallback",          node_fallback)            # Node 4
     wf.add_node("assemble",          node_assemble)            # Node 5
 
-    wf.set_entry_point("reformulate_query")
+    wf.set_entry_point("greetings")
+    wf.add_conditional_edges(
+        "greetings",
+        _route_after_greetings,
+        {"reformulate_query": "reformulate_query", "end": END},
+    )
     wf.add_edge("reformulate_query", "generate_sql")
 
     wf.add_conditional_edges(
@@ -700,6 +907,7 @@ def analyze_query_structured(
             "raw_conn":              raw_conn,
             "llm":                   llm,
             "chat_history":          chat_history or [],
+            "common_question":        None,
             "reformulated_question": None,
             "generated_sql":         None,
             "sql_error":             None,
